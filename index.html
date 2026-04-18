@@ -897,10 +897,10 @@ select.input{cursor:pointer;appearance:none;-webkit-appearance:none;
     <div style="display:flex;align-items:center;gap:12px">
       <div style="font-size:24px">🔔</div>
       <div style="flex:1;min-width:0">
-        <div style="font-size:13px;font-weight:600">Notificações do Navegador</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">Ative para receber alertas em tempo real</div>
+        <div style="font-size:13px;font-weight:600">Notificações Push</div>
+        <div id="push-status" style="font-size:11px;color:var(--muted);margin-top:2px">Ative para receber alertas mesmo com app fechado</div>
       </div>
-      <button class="btn" onclick="requestNotifications()" style="padding:10px 14px;flex-shrink:0;font-size:11px">ATIVAR</button>
+      <button id="push-btn" class="btn" onclick="subscribeToPush()" style="padding:10px 14px;flex-shrink:0;font-size:11px">ATIVAR</button>
     </div>
   </div>
 
@@ -1919,12 +1919,109 @@ async function addReminder() {
   showToast('🔔', 'Lembrete criado!', `${time} — ${name}`);
 }
 
-function requestNotifications() {
-  if (!('Notification' in window)) { showToast('❌', 'Não suportado', 'Este navegador não suporta notificações'); return; }
-  Notification.requestPermission().then(p => {
-    if (p === 'granted') showToast('✅', 'Notificações ativas!', 'Você receberá alertas');
-    else                 showToast('❌', 'Bloqueado', 'Permita nas configurações do navegador');
-  });
+// ── Push Notifications (Web Push VAPID) ──────────────────
+const VAPID_PUBLIC_KEY = 'BLLVQ5V0OBc8kwxdj8kRDI1Fdg7NSfNGVvL9sfkRHV8Oz9dvjagCoIW99pF6a3wRLND_3dc3MVELOyqkHzuYMZM';
+
+function urlBase64ToUint8Array(b64) {
+  const pad = '='.repeat((4 - b64.length % 4) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+}
+
+function setPushStatus(text, ok) {
+  const el = document.getElementById('push-status');
+  if (el) { el.textContent = text; el.style.color = ok === true ? 'var(--green)' : ok === false ? 'var(--red)' : 'var(--muted)'; }
+}
+
+function setPushBtn(label, disabled) {
+  const btn = document.getElementById('push-btn');
+  if (btn) { btn.textContent = label; btn.disabled = disabled; btn.style.opacity = disabled ? '.5' : '1'; }
+}
+
+async function registerSW() {
+  if (!('serviceWorker' in navigator)) return null;
+  try {
+    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    return reg;
+  } catch(e) { console.warn('SW registration failed:', e); return null; }
+}
+
+async function subscribeToPush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    showToast('❌', 'Não suportado', 'Use Chrome/Edge/Safari 16.4+ para push'); return;
+  }
+
+  setPushBtn('ATIVANDO...', true);
+
+  // 1. Request notification permission
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') {
+    setPushStatus('Permissão negada — ative nas configurações', false);
+    setPushBtn('ATIVAR', false);
+    showToast('❌', 'Permissão negada', 'Ative nas configurações do navegador');
+    return;
+  }
+
+  // 2. Register SW (may already be active)
+  let reg = await navigator.serviceWorker.getRegistration('/');
+  if (!reg) reg = await registerSW();
+  if (!reg) {
+    setPushStatus('Erro ao registrar service worker', false);
+    setPushBtn('ATIVAR', false);
+    showToast('❌', 'Erro interno', 'Service worker não registrado');
+    return;
+  }
+
+  // 3. Subscribe to push
+  let sub;
+  try {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+  } catch(e) {
+    setPushStatus('Erro ao criar subscription', false);
+    setPushBtn('ATIVAR', false);
+    showToast('❌', 'Erro push', String(e));
+    return;
+  }
+
+  // 4. Save subscription to Supabase
+  if (S.user && S.db) {
+    const { endpoint, keys } = sub.toJSON();
+    const tz = new Date().getTimezoneOffset(); // minutes behind UTC (positive = behind)
+    const { error } = await S.db.from('push_subscriptions').upsert({
+      user_id: S.user.id,
+      endpoint,
+      p256dh: keys.p256dh,
+      auth:   keys.auth,
+      tz_offset_minutes: tz,
+    }, { onConflict: 'user_id' });
+
+    if (error) {
+      setPushStatus('Assinado localmente (erro ao salvar no servidor)', null);
+      showToast('⚠️', 'Push parcial', error.message);
+    } else {
+      setPushStatus('✅ Push ativo — notificações mesmo com app fechado', true);
+      showToast('✅', 'Push ativado!', 'Você receberá notificações em segundo plano');
+    }
+  } else {
+    setPushStatus('⚠️ Sem conta — push pode não funcionar offline', null);
+    showToast('⚠️', 'Sem conta vinculada', 'Faça login para persistir a assinatura');
+  }
+
+  setPushBtn('ATIVADO ✓', true);
+}
+
+async function checkPushStatus() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  const reg = await navigator.serviceWorker.getRegistration('/');
+  if (!reg) return;
+  const sub = await reg.pushManager.getSubscription();
+  if (sub) {
+    setPushStatus('✅ Push ativo — notificações mesmo com app fechado', true);
+    setPushBtn('ATIVADO ✓', true);
+  }
 }
 
 function checkReminders() {
@@ -2027,6 +2124,9 @@ async function init() {
   setSyncing(false);
   hideLoading();
   setInterval(checkReminders, 60000);
+
+  // Register SW and check existing push subscription
+  registerSW().then(() => checkPushStatus());
 }
 
 document.addEventListener('DOMContentLoaded', init);
